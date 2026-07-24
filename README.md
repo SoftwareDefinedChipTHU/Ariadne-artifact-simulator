@@ -1,6 +1,6 @@
-# AriadneAE
+# Ariadne-artifact-simulator
 
-AriadneAE contains three main components for generating Ariadne CGRA configurations, running temporal simulations, and parsing test logs:
+Ariadne-artifact-simulator contains three main components for generating Ariadne CGRA configurations, running temporal simulations, and parsing test logs:
 
 ```text
 .dot + .dot.map
@@ -228,3 +228,8 @@ run_all_tests_windows.bat      Windows test runner
 run_all_tests_ubuntu.sh        Ubuntu test runner
 build.sbt                      Scala and SBT build configuration
 ```
+
+## License
+
+This project is licensed under the Apache License 2.0. See
+[LICENSE](LICENSE) for details.
