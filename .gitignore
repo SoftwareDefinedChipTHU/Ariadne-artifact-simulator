@@ -1,0 +1,28 @@
+# sbt build outputs
+target/
+project/target/
+project/project/
+
+# Metals and BSP
+.metals/
+.bloop/
+.bsp/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+
+# Scala worksheets and caches
+.scala-build/
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
