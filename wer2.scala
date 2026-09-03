@@ -8,9 +8,21 @@ import scala.collection.mutable
 // import scala.Enumeration.Value
 
 
-// sbt "runMain mycgratemporal.Main" > output.log
+// sbt "runMain mycgratemporal.Main"
+// sbt "runMain mycgratemporal.Main --no-debug"
 
-class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: Int = 32, tagWidth: Int = 16, numInst: Int = 32, outnum: Int = 9, fifoDepth: Int = 8, numDin: Int = 4, val if_print: Boolean = false, val if_print_config: Boolean = false) {
+object SimDebug {
+  var profile: Boolean = true
+  var maxPrintCycle: Int = Int.MaxValue
+
+  def parse(args: Array[String]): Unit = {
+    profile = !args.exists(a => a == "--no-debug" || a == "--no-profile")
+  }
+
+  def log(x: Any): Unit = if (profile) println(x)
+}
+
+class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: Int = 32, tagWidth: Int = 16, numInst: Int = 16, outnum: Int = 9, fifoDepth: Int = 8, numDin: Int = 4, val if_print: Boolean = SimDebug.profile, val if_print_config: Boolean = false, val if_print_profile: Boolean = SimDebug.profile) {
   
   // --- Configuration and Data Structures ---
 
@@ -82,6 +94,19 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
     val PRED_OR_REV          = Value(43)
     val DATA_TRIGGERED_GEN   = Value(44)
     val NULL                 = Value(45)
+    val D1_TRIGGERED_GEN     = Value(74)
+    val DATA_TRIG_FP2INT     = Value(70)
+    val DATA_TRIG_INT2FP     = Value(71)
+    val PRED_REV_FP2INT      = Value(72)
+    val PRED_REV_INT2FP      = Value(73)
+    val FP2UINT              = Value(76)
+    val UINT2FP              = Value(77)
+    val PRED_FP2UINT         = Value(78)
+    val PRED_UINT2FP         = Value(79)
+    val DATA_TRIG_FP2UINT    = Value(80)
+    val DATA_TRIG_UINT2FP    = Value(81)
+    val PRED_REV_FP2UINT     = Value(82)
+    val PRED_REV_UINT2FP     = Value(83)
 
     val UREM                 = Value(60)
     val SREM                 = Value(61)
@@ -232,7 +257,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       val size: Int = 65536,
       val readPorts: Int = 1,
       val writePorts: Int = 1,
-      val accessLatency: Int = 1
+      val accessLatency: Int = 2
   ) {
     // private 
     val mem = Array.fill(size)(0)
@@ -257,8 +282,8 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       if (issuedLoadsThisCycle < readPorts) {
         req.issue = true
         issuedLoadsThisCycle += 1
+        loadQueue.enqueue(req)
       }
-      loadQueue.enqueue(req)
       req
     }
 
@@ -269,8 +294,8 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       if (issuedStoresThisCycle < writePorts) {
         req.issue = true
         issuedStoresThisCycle += 1
+        storeQueue.enqueue(req)
       }
-      storeQueue.enqueue(req)
       req
     }
 
@@ -298,6 +323,8 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
       resetCycle()
     }
+
+    def busy: Boolean = loadQueue.nonEmpty || storeQueue.nonEmpty
   }
 
   def toMutableMap[A](arr: Array[A]): mutable.Map[Int, A] = {
@@ -383,7 +410,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
   def parseInstructionFromLong(rawInst: Long): Instruction = {
     // Bitmasks for each field
     val m: Long = if (DATA_WIDTH <= 0 || DATA_WIDTH > 64) 0L else (1L << DATA_WIDTH) - 1
-    val immBitsRaw     = ((rawInst >>> DATA_WIDTH) & m).toInt  // 32b
+    val immBitsRaw     = ((rawInst >>> DATA_WIDTH) & m).toInt  // 高 32b
     val reversedImm = reverseBitsDATA_WIDTH(immBitsRaw)
     val immediateValue = immBitsRaw.toInt
     // if (if_print) {
@@ -463,15 +490,18 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
     // parse instarray: PEInstArray(pe)(inst)
     def parsePEInst(): Array[Array[Array[Int]]] = {
 
+      // 保存结果的临时结构：每个PE下有多个指令，每个指令是一串Int
       val peBuffer = ArrayBuffer[ArrayBuffer[Array[Int]]]()
       var currentPE: ArrayBuffer[Array[Int]] = null
 
       for (line <- lines) {
         val trimmed = line.trim
         if (trimmed.startsWith("remuPEInst(") && trimmed.contains("Instructions:") && !trimmed.contains("):")) {
+          // 新的 PE 块开始
           currentPE = ArrayBuffer[Array[Int]]()
           peBuffer += currentPE
         } else if (trimmed.startsWith("remuPEInst(") && trimmed.contains("):")) {
+          // 某个指令行
           val parts = trimmed.split(":")
           if (parts.length == 2) {
             val nums = parts(1).split(",").map(_.trim).filter(_.nonEmpty).map(_.toInt)
@@ -480,6 +510,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
         }
       }
 
+      // 转成 Array[Array[Array[Int]]]
       peBuffer.map(pe => pe.toArray).toArray
     }
 
@@ -502,6 +533,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
     /*-------------------------------------------------------------------------------*/
     // parse peout: PEOut(pe)(d)(inst)(port)
     def parseRemuPEOut(): Array[Array[Array[Array[Int]]]] = {
+      // 用于存储最终结果，先用可变列表
       val data = ArrayBuffer[ArrayBuffer[ArrayBuffer[Array[Int]]]]()
       var currentPE: ArrayBuffer[ArrayBuffer[Array[Int]]] = null
       var currentD = 0
@@ -509,25 +541,33 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       for (line <- lines) {
         val trimmed = line.trim
 
+        // 匹配新的 PE 行，例如：remuPEOut(0) Routing D0:
         if (trimmed.startsWith("remuPEOut(") && trimmed.contains("Routing D")) {
+          // 提取 PE 编号
           val peIndex = "\\((\\d+)\\)".r.findFirstMatchIn(trimmed).get.group(1).toInt
+          // 提取 D 通道编号
           val dStr = "D(\\d+)".r.findFirstMatchIn(trimmed).get.group(1).toInt
           currentD = dStr
 
+          // 保证 data 长度足够
           while (data.size <= peIndex) data += ArrayBuffer()
           currentPE = data(peIndex)
 
+          // 保证当前 PE 的 D 通道长度足够
           while (currentPE.size <= currentD) currentPE += ArrayBuffer()
         }
+        // 匹配每条指令行，例如：remuPEOut Routing D0(0)(3): 0, 0, 0, 0, 0, 0, 0, 0, 1
         else if (trimmed.startsWith("remuPEOut Routing D")) {
           val parts = trimmed.split(":")
           if (parts.length == 2) {
             val nums = parts(1).split(",").map(_.trim).filter(_.nonEmpty).map(_.toInt)
+            // 添加到当前 PE 当前 D 通道
             currentPE(currentD) += nums
           }
         }
       }
 
+      // 转换为固定大小的多维数组
       val numPE = data.length
       val numD = data.map(_.length).max
       // val numInst = data.flatMap(_.map(_.length)).max
@@ -576,11 +616,13 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       for (line <- lines) {
         val trimmed = line.trim
 
+        // 匹配新的 PE 行，例如：remuPEData(0):
         if (trimmed.startsWith("remuPEData(") && trimmed.endsWith(":")) {
           val peIndex = "\\((\\d+)\\)".r.findFirstMatchIn(trimmed).get.group(1).toInt
           while (data.size <= peIndex) data += ArrayBuffer()
           currentPE = data(peIndex)
         }
+        // 匹配指令行，例如：remuPEData(0)(0): 1, 0, 0, 1
         else if (trimmed.startsWith("remuPEData(")) {
           val parts = trimmed.split(":")
           if (parts.length == 2) {
@@ -626,6 +668,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
     // Redistribute: PERedist(pe)(inst)(data)(0 = tags / 1 = forward)(tagWidth)
     def parseRemuRedist(): (Array[Array[Array[Array[Int]]]], Array[Array[Array[Array[Int]]]]) = {
 
+      // 临时收集数据
       val data = ArrayBuffer[ArrayBuffer[ArrayBuffer[Array[Int]]]]()
       var currentPE: ArrayBuffer[ArrayBuffer[Array[Int]]] = null
       var currentInst: ArrayBuffer[Array[Int]] = null
@@ -642,41 +685,48 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
             val instIdx = instStr.toInt
             val dataIdx = dataStr.toInt
 
+            // 确保 PE 容器存在
             while (data.size <= peIdx) data += ArrayBuffer()
             currentPE = data(peIdx)
 
+            // 确保 Inst 容器存在
             while (currentPE.size <= instIdx) currentPE += ArrayBuffer()
             currentInst = currentPE(instIdx)
 
+            // 确保 Data slot 存在
             while (currentInst.size <= dataIdx) currentInst += Array.ofDim[Int](tagWidth + numInst)
 
+            // 解析 Tags
             if (i + 1 < lines.length && lines(i + 1).trim.startsWith("remuRedist Tags")) {
               val tags = lines(i + 1).trim.split(":")(1).trim.split(",").map(_.trim.toInt)
               Array.copy(tags, 0, currentInst(dataIdx), 0, tagWidth)
             }
 
+            // 解析 Forward
             if (i + 2 < lines.length && lines(i + 2).trim.startsWith("remuRedist Forward")) {
               val fwd = lines(i + 2).trim.split(":")(1).trim.split(",").map(_.trim.toInt)
               //println(fwd)
               Array.copy(fwd, 0, currentInst(dataIdx), tagWidth, numInst)
             }
 
-            i += 2
+            i += 2 // Tags 和 Forward 已处理
           case _ =>
         }
 
         i += 1
       }
 
+      // 计算维度
       val numPE = data.size
       // val numInst = data.map(_.size).max
-      println(numInst," is the numInst")
+      if (if_print_profile) println(numInst," is the numInst")
       val numData = 4 // Data0~Data3
       val remuRedist = Array.ofDim[Int](numPE, numInst, numData, 2, tagWidth)
 
       val PERedistTag     = Array.ofDim[Int](numPE, numInst, numData, tagWidth)
       val PERedistForward = Array.ofDim[Int](numPE, numInst, numData, numInst)
 
+      // 拆分 tags / forward
       for (pe <- data.indices) {
         for (inst <- data(pe).indices) {
           for (d <- data(pe)(inst).indices) {
@@ -725,6 +775,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
     //RegV: PERegTag(pe)(tagbits), PERegInputs(pe)(d0-d3)
     def parseRemuRegV(): (Array[Array[Int]], Array[Array[Int]]) = {
 
+      // 动态确定 regNum
       val regIndices = lines.filter(_.startsWith("remuRegV(")).map { line =>
         line.substring(line.indexOf("(") + 1, line.indexOf(")")).toInt
       }
@@ -758,9 +809,11 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       for (reg <- tags.indices) {
         println(s"remuRegV($reg):")
 
+        // 打印 Tags
         val tagStr = tags(reg).mkString(", ")
         println(s"  Tags:   $tagStr")
 
+        // 打印 Inputs
         val inputStr = inputs(reg).mkString(", ")
         println(s"  Inputs: $inputStr")
       }
@@ -783,7 +836,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
           if (parts.length == 2) {
             buffer.append(parts(1).toInt)
           }
-        } else if (inSection && line.isEmpty) {
+        } else if (inSection && line.isEmpty) { // 遇到空行就结束
           inSection = false
         }
       }
@@ -807,6 +860,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
     /*-------------------------------------------------------------------------------*/
     // RegTag: PERegTag(pe)(tagbits)
     def parseRemuRegTags(): Array[Array[Int]] = {
+      // 动态确定 regNum
       val regIndices = lines.filter(_.startsWith("remuRegTags(")).map { line =>
         line.substring(line.indexOf("(") + 1, line.indexOf(")")).toInt
       }
@@ -832,10 +886,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       for (peId <- peOut.indices) {
         if (d < peOut(peId).length) {
           val insts = peOut(peId)(d)
-          var destinationList = getOrderedDestinations9(peId, rows, cols)
-          if(outnum==rows*cols)
-            destinationList = getOrderedDestinations(peId, rows, cols)
-          
+          val destinationList = getOrderedDestinations9(peId, rows, cols)
           if (ifPrint) println(s"PE($peId) D$d destination list: $destinationList")
 
           val instOuts: Array[Seq[Int]] = insts.map { bitVec =>
@@ -985,14 +1036,22 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
   }
 
   // class RoundRobin[T](outNum: Int) {
+  //   // 当前的优先级顺序，初始为 [0,1,2,...]
   //   private var priorityOrder: List[Int] = (0 until outNum).toList
 
+    /**
+     * 输入: in(i) = Option[data]，表示第 i 个输入是否有效
+     * 输出: Some((idx, data)) 表示仲裁结果
+     */
   //   def arbitrate(in: Array[Option[T]], isfired: Boolean = true): Option[(Int, T)] = {
+  //     // 找第一个有效的 idx，按 priorityOrder 顺序扫描
   //     val chosenIdxOpt = priorityOrder.find(i => in(i).isDefined)
 
   //     chosenIdxOpt match {
   //       case Some(idx) =>
+  //         // 选中 idx，对应的数据
   //         val data = in(idx).get
+  //         // 把 idx 移到队尾（round-robin effect）
   //         if (!isfired)
   //           priorityOrder = priorityOrder.filterNot(_ == idx) :+ idx
   //         Some(idx -> data)
@@ -1001,12 +1060,17 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
   //     }
   //   }
 
+  //   /**
+  //    * 将某个 index 的优先级调成最低
+  //    * 比如原来是 [0,1,2]，调低 1 → [0,2,1]
+  //    */
   //   def lowerPriority(idx: Int): Unit = {
   //     if (priorityOrder.contains(idx)) {
   //       priorityOrder = priorityOrder.filterNot(_ == idx) :+ idx
   //     }
   //   }
 
+  //   /** 获取当前优先级顺序（调试用） */
   //   def getPriority: List[Int] = priorityOrder
   // }
 
@@ -1020,12 +1084,14 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       val chosenIdxOpt = priorityOrder.find(i => validMask(i))
       chosenIdxOpt match {
         case Some(idx) =>
+          // 选中后，把它移到队尾（round-robin 旋转）
           // priorityOrder = priorityOrder.filterNot(_ == idx) :+ idx
           Some(idx)
         case None => None
       }
     }
 
+    /** 把某个 idx 的优先级降到最低 */
     def lowerPriority(idx: Int): Unit = {
       if (priorityOrder.contains(idx)) {
         priorityOrder = priorityOrder.filterNot(_ == idx) :+ idx
@@ -1129,7 +1195,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
         case 8  => 0x6   // 0b0110
         case 9  => if (phi == 0) 0x8 else 0x6  // 0b1000 / 0b0110
         case 10 =>
-          val imms = instructions(instId).immSel
+          val imms = instructions(instId).immSel //10则d1, 01则d0
           inD2(instId) match {
             case Some(entry) if entry.valid && entry.data == 1 => 0xA // 0b1010, d0 + d2
             case Some(entry) if entry.valid && entry.data == 0 => 0x6 // 0b0110, d1 + d2
@@ -1163,69 +1229,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
     def step(): Option[(Int, Seq[DataEntry], Int)] = {
       val readyMask = Array.tabulate(numInst)(i => isReady(i))
       tagsolve_mask = 0
-      // if()
-      rr.arbitrate(readyMask) match {
-        case Some(instId) =>
-          val mask = decodeDataNum(dataNum(instId), phiLoop(instId), instId)
-
-          val emptyEntry = DataEntry(false, -1, 0)
-          val imms = instructions(instId).immSel
-
-          if (((mask >> 3) & 1) == 1 && imms == 1) {
-            inD0(instId) = Some(DataEntry(true, 1, instructions(instId).immediateValue))
-          }
-          val d0 = if (((mask >> 3) & 1) == 1) inD0(instId).getOrElse(emptyEntry) else emptyEntry
-
-          if (((mask >> 2) & 1) == 1 && imms == 2) {
-            inD1(instId) = Some(DataEntry(true, 1, instructions(instId).immediateValue))
-          }
-          val d1 = if (((mask >> 2) & 1) == 1) inD1(instId).getOrElse(emptyEntry) else emptyEntry
-
-          val d2 = if (((mask >> 1) & 1) == 1) inD2(instId).getOrElse(emptyEntry) else emptyEntry
-          val c  = if (((mask >> 0) & 1) == 1) inCin(instId).getOrElse(emptyEntry) else emptyEntry
-
-          val outputs: Seq[DataEntry] = Seq(d0, d1, d2, c)
-
-          Some((instId, outputs, mask))
-
-        case None => None
-      }
-    }
-
-    def step(currentLoadReq: Map[Int, Option[LoadReq]], currentStoreReq: Map[Int, Option[StoreReq]]): Option[(Int, Seq[DataEntry], Int)] = {
-      var readyMask = Array.tabulate(numInst)(i => isReady(i))
-      tagsolve_mask = 0
-      var hasLS=0
-      var pointer=0
-      for(i<-0 until readyMask.length){
-        if(currentLoadReq.contains(i))
-          currentLoadReq(i) match {
-            case Some(req) =>
-              hasLS=1
-              pointer=i
-            case _ => 
-          }
-      }
       
-      for(i<-0 until readyMask.length){
-        if(currentStoreReq.contains(i))
-          currentStoreReq(i) match {
-            case Some(req) =>
-              hasLS=1
-              pointer=i
-            case _ => 
-          }
-      }
-      if(hasLS==1){
-        for(i<-0 until readyMask.length){
-          if(i!=pointer){
-            readyMask(i)=false
-          }
-          else{
-            assert(readyMask(i)==true)
-          }
-        }
-      }
       rr.arbitrate(readyMask) match {
         case Some(instId) =>
           val mask = decodeDataNum(dataNum(instId), phiLoop(instId), instId)
@@ -1248,6 +1252,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
           val outputs: Seq[DataEntry] = Seq(d0, d1, d2, c)
 
+          // 返回三元组
           Some((instId, outputs, mask))
 
         case None => None
@@ -1318,17 +1323,16 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
     val channels_bk: Array[Option[DataEntry]] = Array.fill(outnum+1)(None)
     val fifos_bk: Array[Queue[(Int, Int)]] = Array.fill(subInstNum)(Queue[(Int, Int)]())
 
-    // transferState(row)(col) = 0/1
+    // transferState(row)(col) = 0/1, 表示 row 行的数据是否已经发到 inst col
     val transferState: Array[Array[Int]] = Array.fill(subInstNum, subInstNum)(0)
 
     val transferState_bk: Array[Array[Int]] = Array.fill(subInstNum, subInstNum)(0)
 
     val fifo_out_bool: Array[Boolean] = Array.fill(subInstNum)(false)
+    val ch_out_bool: Array[Boolean] = Array.fill(outnum + 1)(false)
 
     private val arb9to1  = new RoundRobin(outnum+1)
     private val arb16to1 = new RoundRobin(subInstNum)
-
-    var choosenChannel=0
 
     case class Pending(var valid: Boolean = false, var data: Int = 0, var tag: Int = -1, var row: Int = -1)
     val fifoPending: Array[Pending] = Array.fill(subInstNum)(Pending())
@@ -1377,6 +1381,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       }
   
       for (i <- fifo_out_bool.indices) fifo_out_bool(i) = false
+      for (i <- ch_out_bool.indices) ch_out_bool(i) = false
 
     }
 
@@ -1386,14 +1391,24 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       channels_bk(ch) match {
         case None =>
           val row = table.indexWhere(_.tag == tag)
-          if (row >= 0 && fifos_bk(row).size < fifoDepth) {
-            channels_bk(ch) = Some(DataEntry(true, tag, data))
-            // if (if_print) println(s"pushed ($tag, $data) into channel $ch")
-            true
+          if (row >= 0 && fifos(row).size < fifoDepth) {
+            channels(ch) match {
+              case None =>
+                channels_bk(ch) = Some(DataEntry(true, tag, data))
+                // if (if_print) println(s"pushed ($tag, $data) into channel $ch")
+                true
+              case Some(reg) =>
+                if (reg.tag != tag || reg.tag == tag && fifos(row).size + (if (ch_out_bool(ch)) 1 else 0) < fifoDepth) {
+                  channels_bk(ch) = Some(DataEntry(true, tag, data))
+                  // if (if_print) println(s"pushed ($tag, $data) into channel $ch")
+                  true
+                } else false
+            }
           } else false
         case Some(reg) =>
+          // 写通只允许发生在本拍 Channel→FIFO 仲裁选中并转发的那条 channel
           val row = table.indexWhere(_.tag == reg.tag)
-          if (row >= 0 && fifos_bk(row).size < fifoDepth && reg.tag != tag && fifo_out_bool(row) && this.choosenChannel==ch) {
+          if (row >= 0 && fifos(row).size < fifoDepth && reg.tag != tag && fifo_out_bool(row) && ch_out_bool(ch)) {
             channels_bk(ch) = Some(DataEntry(true, tag, data))
             // if (if_print) println(s"pushed ($tag, $data) into channel $ch")
             true
@@ -1405,11 +1420,17 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
       channels_bk(ch) match {
         case None =>
           val row = table.indexWhere(_.tag == tag)
-          row >= 0 && fifos_bk(row).size < fifoDepth
+          row >= 0 && fifos(row).size < fifoDepth && (channels(ch) match {
+            case None => true
+            case Some(reg) =>
+              if (reg.tag != tag || reg.tag == tag && fifos(row).size + (if (ch_out_bool(ch)) 1 else 0) < fifoDepth) {
+                true
+              } else false
+          })
 
         case Some(reg) =>
           val row = table.indexWhere(_.tag == reg.tag)
-          row >= 0 && fifos_bk(row).size < fifoDepth && reg.tag != tag && fifo_out_bool(row) && this.choosenChannel==ch
+          row >= 0 && fifos(row).size < fifoDepth && reg.tag != tag && fifo_out_bool(row) && ch_out_bool(ch)
       }
     }
 
@@ -1423,14 +1444,13 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
             val row = table.indexWhere(_.tag == reg.tag)
             if (row >= 0 && fifos(row).size < fifoDepth) {
               fifos_bk(row).enqueue((reg.data, reg.tag))
-              channels_bk(ch) = None
+              channels_bk(ch) = None // 消耗 channel
+              ch_out_bool(ch) = true
             }
             else {
               arb9to1.lowerPriority(ch)
             }
-            this.choosenChannel=ch
           }
-
         case None => // no channel valid
       }
 
@@ -1441,6 +1461,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
           val (data, tag) = fifos(row).front
           val targetVec   = table(row).dataBit
 
+          // 计算哪个 inst 还没收到
           val instIdxOpt = (0 until subInstNum).find { instIdx =>
             val need = ((targetVec >> instIdx) & 1) == 1
             val sent = transferState(row)(instIdx) == 1
@@ -1449,8 +1470,9 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
           instIdxOpt match {
             case None =>
+              // 全部发完 -> 出队 + 清零
               fifos_bk(row).dequeue()
-              java.util.Arrays.fill(transferState(row), 0)
+              java.util.Arrays.fill(transferState_bk(row), 0)
 
             case Some(instIdx) =>
               val success = tagsolve.pushData(instIdx, din, tag, data)
@@ -1487,18 +1509,19 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
    * @param cols The number of columns in the PE array.
    * @param config The `CgraConfiguration` containing instructions and routing.
    */
-  class CGRA(val rows: Int, val cols: Int, config: CgraConfiguration, numInst: Int = 16, numDin: Int = 4, tagWidth: Int = 16, fifoDepth: Int = 8, outnum: Int = 9) {
+  class CGRA(val rows: Int, val cols: Int, config: CgraConfiguration, numInst: Int = 16, numDin: Int = 4, tagWidth: Int = 16, fifoDepth: Int = 8, outnum: Int = 9, accessLatency: Int = 2) {
     private val peArray: Array[Array[PE]] = Array.ofDim[PE](rows, cols)
     private val tagSolveArray: Array[Array[TagSolve]] = Array.ofDim[TagSolve](rows, cols)
     private val inputNewArray: Array[Array[Array[RemuInputNew]]] = Array.ofDim[RemuInputNew](rows, cols, numDin)
     private var globalCycle: Long = 0
+    def currentCycle: Long = globalCycle
     private val nocAdjacencyList: Map[Int, Set[Int]] = Map.empty
     val regs_valid: Array[Int] = config.peRegValid.values.toArray
     val isPEnull: Map[Int, Boolean] = Map((0 until rows * cols).map(i => i -> true): _*)
 
 
     // --- Initialize Memory ---
-    val memory: Memory = new Memory(size = 65536*16, readPorts = 12, writePorts = 12, accessLatency = 1)
+    val memory: Memory = new Memory(size = 65536*16, readPorts = 4, writePorts = 4, accessLatency = accessLatency)
 
     val cgrainstructions: Map[Int, Array[Instruction]] = config.peInstArray.map { case (peId, instArrays) =>
         val insts = instArrays.zipWithIndex.map { case (instBits, instIdx) =>
@@ -1541,10 +1564,12 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
       // write configs into pe, tagsolve, and inputnews 
       if (!isPEnull(id)) {
-        println(s"PE $id:")
-        println(s"====== Instructions ======")
-        for ((idx, inst) <- instructions) {
-          if (inst.opType != InstructionType.NULL) println(s"  Inst $idx: $inst")
+        if (if_print_profile) {
+          println(s"PE $id:")
+          println(s"====== Instructions ======")
+          for ((idx, inst) <- instructions) {
+            if (inst.opType != InstructionType.NULL) println(s"  Inst $idx: $inst")
+          }
         }
 
         for (i <- 0 until numInst) {
@@ -1577,12 +1602,6 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
           peArray(r)(c).reg_data = 1
           peArray(r)(c).reg_tag = parseBitArrayToInt(config.peRegTag(id))
           peArray(r)(c).reg_valid = config.peRegInputs(id)
-          for (j <- 0 until numDin) {
-            if (peArray(r)(c).reg_valid(j) == 1) {
-              inputNewArray(r)(c)(j).channels(inputNewArray(r)(c)(j).outnum) = Some(DataEntry(true, peArray(r)(c).reg_tag, 1))
-              println(s"forced write (true, ${peArray(r)(c).reg_tag}, 1) into channel ${inputNewArray(r)(c)(j).outnum}")
-            }
-          }
         }
         if (if_print) {
           println(s"====== Reg ======")
@@ -1593,9 +1612,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
           println(s"============================================================")
           println()
         }
-        if(outnum==rows*cols)
-        nocAdjacencyList(id) = Set(getOrderedDestinations(id, rows, cols): _*)
-        else nocAdjacencyList(id) = Set(getOrderedDestinations9(id, rows, cols): _*)
+        nocAdjacencyList(id) = Set(getOrderedDestinations9(id, rows, cols): _*)
       }
     }
 
@@ -1618,12 +1635,15 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
     def boolToInt(b: Boolean): Int = if (b) 1 else 0
 
-
     /**
      * Executes one cycle of the simulation.
      */
     def step(): Unit = {
-      println(s"--- Global Cycle: $globalCycle ---")
+      val if_print =
+        CgraSimulatorTemporal.this.if_print && globalCycle < SimDebug.maxPrintCycle
+      val if_print_profile =
+        CgraSimulatorTemporal.this.if_print_profile && globalCycle < SimDebug.maxPrintCycle
+      if (if_print_profile) println(s"--- Global Cycle: $globalCycle ---")
       // var datain0_valid = false
       // var datain1_valid = false
       // var predin0_valid = false
@@ -1637,7 +1657,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
       memory.step()
       // ROUND 1: Read inputs and execute instructions
-      println("Round 1: Execution Phase")
+      if (if_print_profile) println("Round 1: Execution Phase")
       val peExecutionQueue = new ArrayBuffer[PE]()
       for {
         r <- 0 until rows
@@ -1701,8 +1721,6 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
           // tagsolve.printbkInputs()
         }
 
-        // val matchresult = tagsolve.step(pe.currentLoadReq,pe.currentStoreReq)
-
         val matchresult = tagsolve.step()
 
         matchresult match {
@@ -1713,7 +1731,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
             pe.data_in2 = outputs(2)   
             pe.carry_in = outputs(3)
             tagsolve.tagsolve_mask = m
-            println(s"PE ${pe.id} choose instruction${instId} ${pe.instructions(instId)}")
+            if (if_print_profile) println(s"PE ${pe.id} choose instruction${instId} ${pe.instructions(instId)}")
 
             val instruction = pe.instructions.getOrElse(instId, Instruction(InstructionType.NULL, 0, 0, 0, -1))
             if (instruction.immSel == 1) { //d0 is imm
@@ -1810,6 +1828,9 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
           case InstructionType.DATA_TRIGGERED_GEN => 
             result = instruction.immediateValue
             pe.data_out = DataEntry(true, instruction.tag, result)
+          case InstructionType.D1_TRIGGERED_GEN =>
+            result = instruction.immediateValue
+            pe.data_out = DataEntry(true, instruction.tag, result)
           case InstructionType.LOOP_OUT_DATA =>
             val (resulttmp, predResulttmp, loopValid) = pe.fsms(choseninst).get(InstructionType.LOOP_OUT_DATA) match {
               case Some(fsm) =>
@@ -1848,7 +1869,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
             pe.data_out = DataEntry(true, instruction.tag, result)
           case InstructionType.LOAD => 
             val book = pe.loadBook.getOrElse(choseninst, LoadBook())
-            print(s"STATE: ${book.state} -> ")
+            if (if_print_profile) print(s"STATE: ${book.state} -> ")
             book.state match {
               case LoadState.Idle => 
                 val req = memory.load(finalData0)  
@@ -1877,11 +1898,11 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
                   case _ =>
                 }
               }
-              println(pe.loadBook.getOrElse(choseninst, LoadBook()).state)
+              if (if_print_profile) println(pe.loadBook.getOrElse(choseninst, LoadBook()).state)
           case InstructionType.PRED_LOAD =>
             if (true) {
               val book = pe.loadBook.getOrElse(choseninst, LoadBook())
-              print(s"STATE: ${book.state} -> ")
+              if (if_print_profile) print(s"STATE: ${book.state} -> ")
               book.state match {
                 case LoadState.Idle => 
                   val req = memory.load(finalData0)  
@@ -1912,66 +1933,49 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
                     case _ =>
                   }
                 }
-                println(pe.loadBook.getOrElse(choseninst, LoadBook()).state)
+                if (if_print_profile) println(pe.loadBook.getOrElse(choseninst, LoadBook()).state)
               }
           case InstructionType.STORE => 
             val book = pe.storeBook.getOrElse(choseninst, StoreBook())
-            print(s"STATE: ${book.state} -> ")
+            if (if_print_profile) print(s"STATE: ${book.state} -> ")
             book.state match {
               case StoreState.Idle =>
-                val req = memory.store(finalData1, finalData0)  
+                val req = memory.store(finalData1, finalData0)
                 if (req.issue) {
-                  pe.storeBook(choseninst) = StoreBook(state = StoreState.Issue)
-                  pe.currentStoreReq(choseninst) = Some(req)
+                  pe.storeBook(choseninst) = StoreBook(StoreState.Idle)
+                  pe.currentStoreReq(choseninst) = None
+                  tagsolve.clearTagsolveInputs(choseninst)
                 } else {
-                  pe.storeBook(choseninst) = StoreBook(StoreState.Idle) 
+                  pe.storeBook(choseninst) = StoreBook(StoreState.Idle)
                   pe.currentStoreReq(choseninst) = None
                   tagsolve.lowerPriority(choseninst)
                 }
-                
-              // case StoreState.Issue =>
-              //   pe.currentStoreReq(choseninst) match {
-              //     case Some(req) if req.valid =>
-              //       pe.storeBook(choseninst) = StoreBook(StoreState.Idle)
-              //       pe.currentStoreReq(choseninst) = None
-              //     case _ =>
-              //   }
-              //   tagsolve.lowerPriority(choseninst)
             }
-            println(pe.storeBook.getOrElse(choseninst, StoreBook()).state)
+            if (if_print_profile) println(pe.storeBook.getOrElse(choseninst, StoreBook()).state)
 
           case InstructionType.PRED_STORE_NO_COUT => 
             if (true) {
               val book = pe.storeBook.getOrElse(choseninst, StoreBook())
-              print(s"STATE: ${book.state} -> ")
+              if (if_print_profile) print(s"STATE: ${book.state} -> ")
               book.state match {
                 case StoreState.Idle =>
-                  val req = memory.store(finalData1, finalData0)  
+                  val req = memory.store(finalData1, finalData0)
                   if (req.issue) {
-                    // pe.storeBook(choseninst) = StoreBook(state = StoreState.Issue)
-                    // pe.currentStoreReq(choseninst) = Some(req)
-                    pe.storeBook(choseninst) = StoreBook(StoreState.Idle) 
+                    pe.storeBook(choseninst) = StoreBook(StoreState.Idle)
                     pe.currentStoreReq(choseninst) = None
+                    tagsolve.clearTagsolveInputs(choseninst)
                   } else {
-                    pe.storeBook(choseninst) = StoreBook(StoreState.Idle) 
+                    pe.storeBook(choseninst) = StoreBook(StoreState.Idle)
                     pe.currentStoreReq(choseninst) = None
                     tagsolve.lowerPriority(choseninst)
                   }
-
-                // case StoreState.Issue =>
-                //   pe.currentStoreReq(choseninst) match {
-                //     case Some(req) if req.valid =>
-                //       pe.storeBook(choseninst) = StoreBook(StoreState.Idle)
-                //       pe.currentStoreReq(choseninst) = None
-                //     case _ =>
-                //   }
               }
-              println(pe.storeBook.getOrElse(choseninst, StoreBook()).state)
+              if (if_print_profile) println(pe.storeBook.getOrElse(choseninst, StoreBook()).state)
             }
           case InstructionType.PRED_STORE_WITH_COUT => 
             if (true) {
               val book = pe.storeBook.getOrElse(choseninst, StoreBook())
-              print(s"STATE: ${book.state} -> ")
+              if (if_print_profile) print(s"STATE: ${book.state} -> ")
               book.state match {
                 case StoreState.Idle =>
                   val req = memory.store(finalData1, finalData0)  
@@ -1994,11 +1998,11 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
                 case StoreState.Out =>
                     pe.data_out = DataEntry(true, instruction.tag, 1)
                }
-               println(pe.storeBook.getOrElse(choseninst, StoreBook()).state)
+               if (if_print_profile) println(pe.storeBook.getOrElse(choseninst, StoreBook()).state)
             }
           case InstructionType.STORE_OUT => 
             val book = pe.storeBook.getOrElse(choseninst, StoreBook())
-            print(s"STATE: ${book.state} -> ")
+            if (if_print_profile) print(s"STATE: ${book.state} -> ")
             book.state match {
               case StoreState.Idle =>
                 val req = memory.store(finalData1, finalData0)  
@@ -2021,7 +2025,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
               case StoreState.Out =>
                   pe.data_out = DataEntry(true, instruction.tag, 1)
               }
-            println(pe.storeBook.getOrElse(choseninst, StoreBook()).state)
+            if (if_print_profile) println(pe.storeBook.getOrElse(choseninst, StoreBook()).state)
           case InstructionType.PHI_BRANCH_DATA => 
             result = if (finalData2 == 1) finalData0 else finalData1
             pe.data_out = DataEntry(true, instruction.tag, result)
@@ -2064,21 +2068,73 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
             pe.data_out = DataEntry(true, instruction.tag, result)
           case InstructionType.NULL => ()
 
-          case InstructionType.FP2INT => 
+          case InstructionType.FP2INT | InstructionType.DATA_TRIG_FP2INT => 
             result = Math.round(java.lang.Float.intBitsToFloat(finalData0))
             pe.data_out = DataEntry(true, instruction.tag, result)
-          case InstructionType.INT2FP => 
+          case InstructionType.INT2FP | InstructionType.DATA_TRIG_INT2FP => 
             result = java.lang.Float.floatToIntBits(finalData0.toFloat)
             pe.data_out = DataEntry(true, instruction.tag, result)
+          case InstructionType.FP2UINT | InstructionType.DATA_TRIG_FP2UINT =>
+            result = (java.lang.Float.intBitsToFloat(finalData0).toLong & 0xffffffffL).toInt
+            pe.data_out = DataEntry(true, instruction.tag, result)
+          case InstructionType.UINT2FP | InstructionType.DATA_TRIG_UINT2FP =>
+            result = java.lang.Float.floatToIntBits(Integer.toUnsignedLong(finalData0).toFloat)
+            pe.data_out = DataEntry(true, instruction.tag, result)
           case InstructionType.PRED_FP2INT => 
-            if (finalData2 == 1) {
+            if ((finalData1 & 1) == 1) {
               result = Math.round(java.lang.Float.intBitsToFloat(finalData0))
               pe.data_out = DataEntry(true, instruction.tag, result)
+            } else {
+              pe.drop_data(choseninst) = true
+            }
+          case InstructionType.PRED_FP2UINT =>
+            if ((finalData1 & 1) == 1) {
+              result = (java.lang.Float.intBitsToFloat(finalData0).toLong & 0xffffffffL).toInt
+              pe.data_out = DataEntry(true, instruction.tag, result)
+            } else {
+              pe.drop_data(choseninst) = true
             }
           case InstructionType.PRED_INT2FP => 
-            if (finalData2 == 1) {
+            if ((finalData1 & 1) == 1) {
               result = java.lang.Float.floatToIntBits(finalData0.toFloat)
               pe.data_out = DataEntry(true, instruction.tag, result)
+            } else {
+              pe.drop_data(choseninst) = true
+            }
+          case InstructionType.PRED_UINT2FP =>
+            if ((finalData1 & 1) == 1) {
+              result = java.lang.Float.floatToIntBits(Integer.toUnsignedLong(finalData0).toFloat)
+              pe.data_out = DataEntry(true, instruction.tag, result)
+            } else {
+              pe.drop_data(choseninst) = true
+            }
+          case InstructionType.PRED_REV_FP2INT =>
+            if ((finalData1 & 1) == 0) {
+              result = Math.round(java.lang.Float.intBitsToFloat(finalData0))
+              pe.data_out = DataEntry(true, instruction.tag, result)
+            } else {
+              pe.drop_data(choseninst) = true
+            }
+          case InstructionType.PRED_REV_FP2UINT =>
+            if ((finalData1 & 1) == 0) {
+              result = (java.lang.Float.intBitsToFloat(finalData0).toLong & 0xffffffffL).toInt
+              pe.data_out = DataEntry(true, instruction.tag, result)
+            } else {
+              pe.drop_data(choseninst) = true
+            }
+          case InstructionType.PRED_REV_INT2FP =>
+            if ((finalData1 & 1) == 0) {
+              result = java.lang.Float.floatToIntBits(finalData0.toFloat)
+              pe.data_out = DataEntry(true, instruction.tag, result)
+            } else {
+              pe.drop_data(choseninst) = true
+            }
+          case InstructionType.PRED_REV_UINT2FP =>
+            if ((finalData1 & 1) == 0) {
+              result = java.lang.Float.floatToIntBits(Integer.toUnsignedLong(finalData0).toFloat)
+              pe.data_out = DataEntry(true, instruction.tag, result)
+            } else {
+              pe.drop_data(choseninst) = true
             }
           case InstructionType.UDIV => 
             result = if (finalData1 == 0) 0 else java.lang.Integer.divideUnsigned(finalData0, finalData1)
@@ -2115,7 +2171,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
             pe.data_out = DataEntry(true, instruction.tag, result)
 
           // Add other instructions as needed.
-          case _ => println(s"  Warning: Unimplemented instruction type: ${instruction.opType}")
+          case _ => if (if_print_profile) println(s"  Warning: Unimplemented instruction type: ${instruction.opType}")
         }
         
 
@@ -2134,9 +2190,9 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
           
 
         if (pe.currentLoadReq.get(choseninst).flatten.nonEmpty || pe.currentStoreReq.get(choseninst).flatten.nonEmpty) {
-          println(s"  PE(${pe.id}) (${pe.instructions(choseninst)}) ($finalData0,$finalData1,$finalData2,${datain0_valid},${datain1_valid},${datain2_valid}) executed. Result: data=$result. Velid: ${pe.data_out.valid}")
+          if (if_print_profile) println(s"  PE(${pe.id}) (${pe.instructions(choseninst)}) ($finalData0,$finalData1,$finalData2,${datain0_valid},${datain1_valid},${datain2_valid}) executed. Result: data=$result. Velid: ${pe.data_out.valid}")
         } else {
-          println(s"  PE(${pe.id}) (${pe.instructions(choseninst)}) ($finalData0,$finalData1,$finalData2,${datain0_valid},${datain1_valid},${datain2_valid}) executed. Result: data=$result. Valid: ${pe.data_out.valid}")
+          if (if_print_profile) println(s"  PE(${pe.id}) (${pe.instructions(choseninst)}) ($finalData0,$finalData1,$finalData2,${datain0_valid},${datain1_valid},${datain2_valid}) executed. Result: data=$result. Valid: ${pe.data_out.valid}")
         }
 
 
@@ -2144,7 +2200,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
       }
       // ROUND 2: Commit results to destination PEs
-      println("Round 2: Commit Phase")
+      if (if_print_profile) println("Round 2: Commit Phase")
       for {
         r <- 0 until rows
         c <- 0 until cols
@@ -2162,16 +2218,9 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
         
         val peId = pe.id
 
-        if(choseninst != -1)
-        if (pe.instructions(choseninst).opType == InstructionType.PRED_STORE_NO_COUT || pe.instructions(choseninst).opType == InstructionType.STORE) {
-          tagsolve.clearTagsolveInputs(choseninst)
-        }
-
         if (pe.data_out.valid) {
           val instruction = pe.instructions(choseninst)
-          var destinationList = getOrderedDestinations9(peId, rows, cols)
-          if(outnum==rows*cols)
-            destinationList = getOrderedDestinations(peId, rows, cols)
+          val destinationList = getOrderedDestinations9(peId, rows, cols)
 
           // The destination routing is now determined by the outSet arrays
           val outSetD0: Seq[Int] =
@@ -2231,9 +2280,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
           val canSendD0 = if (dataToRoute.valid && outSetD0.nonEmpty) {
             val blocked = outSetD0.filter { destId =>
-              var destlist = getOrderedDestinations9(destId, rows, cols)
-              if(outnum==rows*cols)
-                destlist = getOrderedDestinations(destId, rows, cols)
+              val destlist = getOrderedDestinations9(destId, rows, cols)
               val ch = destlist.indexOf(peId)  
               val canPush = getInputNew(destId).map { input =>
                 val tinput = input(0)
@@ -2243,7 +2290,6 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
             }
             if (blocked.nonEmpty && if_print) {
               println(s"[DEBUG] PE($peId) blocked at D0 routing: ${blocked.mkString(", ")}")
-              if(!dataToRoute.valid) println("No valid")
             }
             blocked.isEmpty
           } else true
@@ -2251,9 +2297,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
           val canSendD1 = if (dataToRoute.valid && outSetD1.nonEmpty) {
             val blocked = outSetD1.filter { destId =>
-              var destlist = getOrderedDestinations9(destId, rows, cols)
-              if(outnum==rows*cols)
-                destlist = getOrderedDestinations(destId, rows, cols)
+              val destlist = getOrderedDestinations9(destId, rows, cols)
               val ch = destlist.indexOf(peId)  
               val canPush = getInputNew(destId).map { input =>
                 val tinput = input(1)
@@ -2269,9 +2313,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
           val canSendD2 = if (dataToRoute.valid && outSetD2.nonEmpty) {
             val blocked = outSetD2.filter { destId =>
-              var destlist = getOrderedDestinations9(destId, rows, cols)
-              if(outnum==rows*cols)
-                destlist = getOrderedDestinations(destId, rows, cols)
+              val destlist = getOrderedDestinations9(destId, rows, cols)
               val ch = destlist.indexOf(peId)   
               val canPush = getInputNew(destId).map { input =>
                 val tinput = input(2)
@@ -2287,9 +2329,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
           val canSendC = if (dataToRoute.valid && outSetC.nonEmpty) {
             val blocked = outSetC.filter { destId =>
-              var destlist = getOrderedDestinations9(destId, rows, cols)
-              if(outnum==rows*cols)
-                destlist = getOrderedDestinations(destId, rows, cols)
+              val destlist = getOrderedDestinations9(destId, rows, cols)
               val ch = destlist.indexOf(peId)   
               val canPush = getInputNew(destId).map { input =>
                 val tinput = input(3)
@@ -2348,9 +2388,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
               val dataEntry = dataToRoute
               // -------- D0 --------
               outSetD0.foreach { destId =>
-                var destlist = getOrderedDestinations9(destId, rows, cols)
-                if(outnum==rows*cols)
-                  destlist = getOrderedDestinations(destId, rows, cols)
+                val destlist = getOrderedDestinations9(destId, rows, cols)
                 val ch = destlist.indexOf(peId) 
                 getInputNew(destId) match {
                   case Some(destPE) if ch >= 0 =>
@@ -2366,8 +2404,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
               // -------- D1 --------
               outSetD1.foreach { destId =>
-                var destlist = getOrderedDestinations9(destId, rows, cols)
-                if(outnum==rows*cols) destlist = getOrderedDestinations(destId, rows, cols)
+                val destlist = getOrderedDestinations9(destId, rows, cols)
                 val ch = destlist.indexOf(peId) 
                 getInputNew(destId) match {
                   case Some(destPE) if ch >= 0 =>
@@ -2383,8 +2420,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
               // -------- D2 --------
               outSetD2.foreach { destId =>
-                var destlist = getOrderedDestinations9(destId, rows, cols)
-                if(outnum==rows*cols) destlist = getOrderedDestinations(destId, rows, cols)
+                val destlist = getOrderedDestinations9(destId, rows, cols)
                 val ch = destlist.indexOf(peId) 
                 getInputNew(destId) match {
                   case Some(destPE) if ch >= 0 =>
@@ -2400,8 +2436,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
               // -------- C --------
               outSetC.foreach { destId =>
-                var destlist = getOrderedDestinations9(destId, rows, cols)
-                if(outnum==rows*cols) destlist = getOrderedDestinations(destId, rows, cols)
+                val destlist = getOrderedDestinations9(destId, rows, cols)
                 val ch = destlist.indexOf(peId) 
                 getInputNew(destId) match {
                   case Some(destPE) if ch >= 0 =>
@@ -2416,7 +2451,7 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
               }
             }
             successfullySent = true
-            println("Inst ",choseninst," at ", peId," successfully sent!")
+            if (if_print_profile) println("Inst ",choseninst," at ", peId," successfully sent!")
           } else {
             successfullySent = false
             // if (dataToRoute.valid) {
@@ -2454,7 +2489,11 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
           pe.carry_out = DataEntry(false, -1, 0)
         } else if (choseninst != -1) {
           val instruction = pe.instructions(choseninst)
-          if (instruction.opType == InstructionType.LOOP_OUT_DATA || instruction.opType == InstructionType.LOOP_OUT_DATA_REV || instruction.opType == InstructionType.PHI_LOOP_DATA || instruction.opType == InstructionType.PRED_OR ||  instruction.opType == InstructionType.PRED_OR_REV) {
+          if (instruction.opType == InstructionType.LOOP_OUT_DATA || instruction.opType == InstructionType.LOOP_OUT_DATA_REV || instruction.opType == InstructionType.PHI_LOOP_DATA || instruction.opType == InstructionType.PRED_OR ||  instruction.opType == InstructionType.PRED_OR_REV ||
+              instruction.opType == InstructionType.PRED_FP2INT || instruction.opType == InstructionType.PRED_INT2FP ||
+              instruction.opType == InstructionType.PRED_FP2UINT || instruction.opType == InstructionType.PRED_UINT2FP ||
+              instruction.opType == InstructionType.PRED_REV_FP2INT || instruction.opType == InstructionType.PRED_REV_INT2FP ||
+              instruction.opType == InstructionType.PRED_REV_FP2UINT || instruction.opType == InstructionType.PRED_REV_UINT2FP) {
             if (pe.drop_data(choseninst)) {
               tagsolve.clearTagsolveInputs(choseninst)
             }
@@ -2513,11 +2552,17 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
       
       globalCycle += 1
-      println("--- End of Cycle ---")
-      println("-----------------------------------------------------------------------------------------------------------")
+      if (if_print_profile) {
+        println("--- End of Cycle ---")
+        println("-----------------------------------------------------------------------------------------------------------")
+      }
     }
 
+    /** Remu PE `rerun` must stay asserted this many cycles before we stop. */
+    val FinishHoldCycles: Int = 64
+
     def isProgramFinished(): Boolean = {
+      if (memory.busy) return false
       var i=0
       for {
         r <- 0 until rows
@@ -2546,22 +2591,124 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
 
     /**
+     * RemuReg `clear`/`start`: re-issue live register tokens so a finished
+     * kernel can be launched again without rebuilding the array.
+     */
+    def start(): Unit = {
+      for {
+        r <- 0 until rows
+        c <- 0 until cols
+      } {
+        val id = r * cols + c
+        if (!isPEnull(id) && regs_valid.isDefinedAt(id) && regs_valid(id) == 1) {
+          val pe = peArray(r)(c)
+          for (j <- 0 until numDin) {
+            if (pe.reg_valid(j) == 1) {
+              val input = inputNewArray(r)(c)(j)
+              input.channels(input.outnum) =
+                Some(DataEntry(true, pe.reg_tag, 1))
+              if (if_print_profile) {
+                println(
+                  s"forced write (true, ${pe.reg_tag}, 1) into channel ${input.outnum}")
+              }
+            }
+          }
+        }
+      }
+    }
+
+    /**
      * Run the simulation for a specified number of cycles.
+     * Pulse `start` first, matching the temporal harness. Do not treat the
+     * power-up empty snapshot as done. After the array has been busy, `rerun`
+     * (all-empty) must hold for FinishHoldCycles in a row.
      */
     def run(cycles: Int): Unit = {
+      start()
+      var idleHold = 0
+      var seenBusy = false
       for (i <- 0 until cycles) {
         step()
         if (isProgramFinished()) {
-          
-          println(s"Program finished at cycle $i")
-          var j=0
-          while(j<8){
-            step()
-            j=j+1
+          if (seenBusy) {
+            idleHold += 1
+            if (idleHold >= FinishHoldCycles) {
+              println(s"Program finished at cycle $i")
+              return
+            }
           }
-          return
+        } else {
+          seenBusy = true
+          idleHold = 0
         }
       }
+      println(s"Program finished at cycle $cycles")
+      dumpBusy("hit-max-cycles")
+    }
+
+    def dumpBusy(reason: String): Unit = {
+      println(s"[dumpBusy] $reason cycle=$globalCycle")
+      var busy = 0
+      for {
+        r <- 0 until rows
+        c <- 0 until cols
+      } {
+        val id = r * cols + c
+        if (isPEnull(id)) {
+          // skip
+        } else {
+          val pe = peArray(r)(c)
+          val tagsolve = tagSolveArray(r)(c)
+          val tagOcc =
+            tagsolve.inD0.count(_.nonEmpty) +
+              tagsolve.inD1.count(_.nonEmpty) +
+              tagsolve.inD2.count(_.nonEmpty) +
+              tagsolve.inCin.count(_.nonEmpty)
+          val loadOcc = pe.currentLoadReq.count { case (_, v) => v.nonEmpty }
+          val storeOcc = pe.currentStoreReq.count { case (_, v) => v.nonEmpty }
+          var fifoOcc = 0
+          var chOcc = 0
+          for (j <- 0 until numDin) {
+            fifoOcc += inputNewArray(r)(c)(j).fifos.count(_.nonEmpty)
+            chOcc += inputNewArray(r)(c)(j).channels.count(_.nonEmpty)
+          }
+          if (tagOcc + loadOcc + storeOcc + fifoOcc + chOcc > 0) {
+            busy += 1
+            println(
+              s"  PE $id tag=$tagOcc fifo=$fifoOcc ch=$chOcc load=$loadOcc store=$storeOcc")
+            tagsolve.printInputs()
+            for (j <- 0 until numDin) {
+              val input = inputNewArray(r)(c)(j)
+              for (row <- input.table.indices if input.fifos(row).nonEmpty) {
+                println(
+                  s"    fifo din$j row=$row tag=${input.table(row).tag} " +
+                    s"n=${input.fifos(row).size} fwd=${input.table(row).dataBit} " +
+                    s"xfer=${input.transferState(row).mkString(",")}")
+              }
+            }
+            for (inst <- 0 until numInst if tagsolve.isReady(inst)) {
+              val dests = config.peIdToOutSetD0.getOrElse(id, Array.empty[Seq[Int]]).lift(inst).getOrElse(Seq.empty[Int])
+              val tag = pe.instructions(inst).tag
+              val reasons = dests.map { destId =>
+                val destlist = getOrderedDestinations9(destId, rows, cols)
+                val ch = destlist.indexOf(id)
+                getInputNew(destId) match {
+                  case Some(inputs) =>
+                    val input = inputs(0)
+                    val row = input.table.indexWhere(_.tag == tag)
+                    val fifoSz = if (row >= 0) input.fifos(row).size else -1
+                    val can = input.canPushChannel(ch, 0, tag)
+                    s"d$destId ch=$ch row=$row fifo=$fifoSz can=$can"
+                  case None =>
+                    s"d$destId missing"
+                }
+              }
+              println(s"    ready inst $inst tag=$tag dests=${dests.mkString(",")} ${reasons.mkString(" | ")}")
+            }
+          }
+        }
+      }
+      println(s"[dumpBusy] busyPEs=$busy finished=${isProgramFinished()}")
     }
 
     // def run(cycles: Int): Unit = {
@@ -2575,9 +2722,9 @@ class CgraSimulatorTemporal(val rows: Int = 8, val cols: Int = 8, DATA_WIDTH: In
 
 object Main {
   def main(args: Array[String]): Unit = {
-    println("Starting CGRA Simulator...")
+    SimDebug.parse(args)
+    if (SimDebug.profile) println("Starting CGRA Simulator...")
 
-    // val fileName = if (args.nonEmpty) args(0) else "arrays_output.txt"
     var fileName = "arrays_output.txt"
     fileName=args.lift(0).getOrElse("ataxno")
     if(fileName=="ataxno"){
@@ -4744,5 +4891,3 @@ object Main {
     }
   }
 }
-
-
